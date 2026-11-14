@@ -6,12 +6,11 @@
 # model_api to gemini/gemini-3.5-flash-lite. serve.py is not edited. No dataset.
 # Secret: GEMINI_API_KEY.
 #
-# mode=score: wind-diaphragm-shear with the committed submission.yaml.
-# Docker applies each container CPU limit on its own, so the 4-CPU task and
-# 2-CPU serve container can share this runner. Memory is the task plus the
-# 4 GiB serve container and 256 MiB egress proxy. The verifier is unchanged
-# and starts after those containers stop.
-# Secrets: HF_TOKEN, VERTEXAI_PROJECT, GCP_SERVICE_ACCOUNT_JSON.
+# mode=score: wind-diaphragm-shear through gemini/gemini-3.5-flash-lite.
+# A temporary copy changes only model_api. serve.py and the dataset verifier
+# stay as published. Secrets: GEMINI_API_KEY and HF_TOKEN. The run uses
+# --trials 1 and --no-export. It does not start unless send_gated_task is yes,
+# because unpaid Gemini may use submitted content to improve Google products.
 name: PLE baseline
 
 "on":
@@ -25,6 +24,14 @@ name: PLE baseline
           - smoke
           - score
         default: smoke
+      send_gated_task:
+        description: score only. Leave no until unpaid-Gemini use of dev-task inputs is allowed.
+        required: true
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
 
 permissions:
   contents: read
@@ -263,6 +270,13 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Stop before gated task data is sent
+        if: inputs.send_gated_task != 'yes'
+        run: |
+          echo "Stopped before downloading or sending wind-diaphragm-shear."
+          echo "Unpaid Gemini uses submitted content to improve Google products. The dataset terms allow external API evaluation and forbid distillation. Leave send_gated_task at no until that point is resolved."
+          exit 1
+
       - name: Check out harness
         uses: actions/checkout@v4
         with:
@@ -383,59 +397,45 @@ jobs:
           fi
           echo "Capacity check passed."
 
-      - name: Run kit check and score wind-diaphragm-shear
+      - name: Score wind-diaphragm-shear
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          VERTEXAI_PROJECT: ${{ secrets.VERTEXAI_PROJECT }}
-          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         working-directory: ple
         run: |
           set -euo pipefail
-          if [ -z "${VERTEXAI_PROJECT:-}" ] || [ -z "${GCP_SERVICE_ACCOUNT_JSON:-}" ]; then
-            echo "VERTEXAI_PROJECT and GCP_SERVICE_ACCOUNT_JSON must be set as GitHub secrets."
+          if [ -z "${HF_TOKEN:-}" ] || [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "GitHub secrets HF_TOKEN and GEMINI_API_KEY must both be set."
             exit 1
           fi
-          umask 077
-          cred="$RUNNER_TEMP/gcp-sa.json"
-          printf '%s' "$GCP_SERVICE_ACCOUNT_JSON" > "$cred"
-          python3 - "$cred" <<'PY'
-          import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          missing = [k for k in ("type", "project_id", "private_key", "client_email") if not data.get(k)]
-          if missing or data.get("type") != "service_account":
-              sys.exit("GCP_SERVICE_ACCOUNT_JSON is not a service-account key")
+          src="$RUNNER_TEMP/score-harness"
+          rm -rf "$src"
+          mkdir -p "$src"
+          tar -C "$GITHUB_WORKSPACE/harness" \
+            --exclude .git \
+            --exclude .github \
+            --exclude '*.env' \
+            --exclude '.env' \
+            -cf - . | tar -C "$src" -xf -
+          python3 - "$src/submission.yaml" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          old = "model_api: google-cloud/claude-opus-5-5\n"
+          new = "model_api: gemini/gemini-3.5-flash-lite\n"
+          if old not in text:
+              sys.exit("the baseline model_api line was not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
-          export GOOGLE_APPLICATION_CREDENTIALS="$cred"
-          MODEL_PROXY_KEY=$(openssl rand -hex 24)
-          echo "::add-mask::${MODEL_PROXY_KEY}"
-          export MODEL_PROXY_KEY VERTEXAI_PROJECT
+          cmp "$GITHUB_WORKSPACE/harness/serve.py" "$src/serve.py"
+          umask 077
           envfile="$RUNNER_TEMP/ple.env"
           {
             printf 'HF_TOKEN=%s\n' "$HF_TOKEN"
-            printf 'MODEL_PROXY_URL=%s\n' "http://127.0.0.1:4000"
-            printf 'MODEL_PROXY_KEY=%s\n' "$MODEL_PROXY_KEY"
+            printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY"
           } > "$envfile"
-          unset GCP_SERVICE_ACCOUNT_JSON
-          bash kit/model_proxy/start.sh > "$RUNNER_TEMP/model-proxy.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/model-proxy.pid"
-          ready=0
-          for _ in $(seq 1 300); do
-            if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:4000/health/liveliness"; then
-              ready=1
-              break
-            fi
-            if ! kill -0 "$(cat "$RUNNER_TEMP/model-proxy.pid")" 2>/dev/null; then
-              echo "The model proxy exited before it accepted connections."
-              exit 1
-            fi
-            sleep 2
-          done
-          if [ "$ready" -ne 1 ]; then
-            echo "The model proxy did not become ready."
-            exit 1
-          fi
-          uv run python -m kit check "$GITHUB_WORKSPACE/harness" --env-file "$envfile"
-          uv run python eval/run.py "$GITHUB_WORKSPACE/harness" \
+          unset HF_TOKEN GEMINI_API_KEY
+          uv run python eval/run.py "$src" \
             --env-file "$envfile" \
             --tasks wind-diaphragm-shear \
             --trials 1 \
@@ -475,14 +475,9 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          if [ -f "$RUNNER_TEMP/model-proxy.pid" ]; then
-            kill "$(cat "$RUNNER_TEMP/model-proxy.pid")" 2>/dev/null || true
-          fi
           rm -rf \
             "$RUNNER_TEMP/ple.env" \
-            "$RUNNER_TEMP/gcp-sa.json" \
-            "$RUNNER_TEMP/model-proxy.log" \
-            "$RUNNER_TEMP/model-proxy.pid" \
+            "$RUNNER_TEMP/score-harness" \
             "$RUNNER_TEMP/ple-run" \
             "$RUNNER_TEMP/wind-task-toml" \
             "$HOME/.cache/plebench" \
