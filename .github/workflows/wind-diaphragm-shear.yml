@@ -1,0 +1,414 @@
+# Manual runs on a standard 4-vCPU ubuntu-24.04 runner.
+# Kit pin: google-research/ple 8320f0402fdca9f42476607f72bcfd5271cd50c9
+# Harbor pin required by that revision: 0.20.0 (with websockets).
+#
+# mode=smoke: kit check's synthetic hello.txt task. A temporary copy sets
+# model_api to gemini/gemini-3.8-flash. serve.py is not edited. No dataset.
+# Secret: GEMINI_API_KEY.
+#
+# mode=score: wind-diaphragm-shear with the committed submission.yaml.
+# Docker applies each container CPU limit on its own, so the 4-CPU task and
+# 2-CPU serve container can share this runner. Memory is the task plus the
+# 4 GiB serve container and 256 MiB egress proxy. The verifier is unchanged
+# and starts after those containers stop.
+# Secrets: HF_TOKEN, VERTEXAI_PROJECT, GCP_SERVICE_ACCOUNT_JSON.
+name: PLE baseline
+
+"on":
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: smoke calls Gemini on a synthetic task. score grades wind-diaphragm-shear.
+        required: true
+        type: choice
+        options:
+          - smoke
+          - score
+        default: smoke
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ple-${{ inputs.mode }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: inputs.mode == 'smoke'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out PLE kit
+        uses: actions/checkout@v4
+        with:
+          repository: google-research/ple
+          ref: 8320f0402fdca9f42476607f72bcfd5271cd50c9
+          path: ple
+          persist-credentials: false
+
+      - name: Install uv
+        run: |
+          set -euo pipefail
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check CPU, RAM, disk, and Docker
+        working-directory: ple
+        run: |
+          set -euo pipefail
+          if find "$GITHUB_WORKSPACE/harness" \( -name '*.env' -o -name 'gcp-sa.json' \) | grep -q .; then
+            echo "The harness checkout contains an env or credential file. Remove it before this run."
+            exit 1
+          fi
+          docker info >/dev/null
+          uv sync --quiet
+          host_cpus=$(nproc)
+          host_mem=$(awk '/MemTotal:/ {print $2 * 1024}' /proc/meminfo)
+          docker_cpus=$(docker info --format '{{.NCPU}}')
+          docker_mem=$(docker info --format '{{.MemTotal}}')
+          disk=$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')
+          # kit check uses a 2-CPU, 4 GiB task container, a 2-CPU, 4 GiB serve
+          # container, and a 256 MiB egress proxy.
+          limit_cpus=2
+          need_mem=$((2 * 4 * 1073741824 + 256 * 1048576))
+          need_disk=$((10 * 1073741824))
+          {
+            echo "### Smoke capacity"
+            echo "- Largest CPU limit: ${limit_cpus}"
+            echo "- Memory reserved together: $((need_mem / 1048576)) MiB"
+            echo "- Host CPUs: ${host_cpus}. Docker CPUs: ${docker_cpus}."
+            echo "- Host RAM: $((host_mem / 1048576)) MiB. Docker RAM: $((docker_mem / 1048576)) MiB."
+            echo "- Free disk: $((disk / 1073741824)) GiB."
+          } >> "$GITHUB_STEP_SUMMARY"
+          short=0
+          if [ "$host_cpus" -lt "$limit_cpus" ] || [ "$docker_cpus" -lt "$limit_cpus" ]; then
+            echo "Need a Docker daemon with at least ${limit_cpus} CPUs. Host has ${host_cpus} and Docker has ${docker_cpus}."
+            short=1
+          fi
+          if [ "$host_mem" -lt "$need_mem" ] || [ "$docker_mem" -lt "$need_mem" ]; then
+            echo "Need ${need_mem} bytes of RAM. Host has ${host_mem} and Docker has ${docker_mem}."
+            short=1
+          fi
+          if [ "$disk" -lt "$need_disk" ]; then
+            echo "Need 10 GiB free disk. This filesystem has ${disk} bytes free."
+            short=1
+          fi
+          if [ "$short" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Capacity check passed."
+
+      - name: Run the synthetic Gemini smoke check
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        working-directory: ple
+        run: |
+          set -euo pipefail
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "GitHub secret GEMINI_API_KEY is empty."
+            exit 1
+          fi
+          src="$RUNNER_TEMP/smoke-harness"
+          rm -rf "$src"
+          mkdir -p "$src"
+          tar -C "$GITHUB_WORKSPACE/harness" \
+            --exclude .git \
+            --exclude .github \
+            --exclude '*.env' \
+            --exclude '.env' \
+            -cf - . | tar -C "$src" -xf -
+          python3 - "$src/submission.yaml" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          old = "model_api: google-cloud/claude-opus-5-5\n"
+          new = "model_api: gemini/gemini-3.8-flash\n"
+          if old not in text:
+              sys.exit("the baseline model_api line was not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+          cmp "$GITHUB_WORKSPACE/harness/serve.py" "$src/serve.py"
+          if cmp -s "$GITHUB_WORKSPACE/harness/submission.yaml" "$src/submission.yaml"; then
+            echo "The smoke copy did not change model_api."
+            exit 1
+          fi
+          umask 077
+          envfile="$RUNNER_TEMP/gemini.env"
+          printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY" > "$envfile"
+          unset GEMINI_API_KEY
+          uv run python -m kit check "$src" --env-file "$envfile" --work "$RUNNER_TEMP/smoke-work"
+
+      - name: Report the smoke stages
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ["RUNNER_TEMP"]) / "smoke-work" / "check.json"
+          lines = ["### Synthetic smoke", ""]
+          if not path.is_file():
+              lines.append("No check.json was written.")
+          else:
+              data = json.loads(path.read_text(encoding="utf-8"))
+              lines.append("- Model: gemini/gemini-3.8-flash through Google AI Studio")
+              lines.append("- Task: kit check synthetic smoke (no PLE dataset)")
+              for stage in data.get("stages") or []:
+                  lines.append(f"- {stage.get('name')}: {stage.get('status')}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Remove the smoke copy and credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf \
+            "$RUNNER_TEMP/smoke-harness" \
+            "$RUNNER_TEMP/gemini.env" \
+            "$RUNNER_TEMP/smoke-work" \
+            "$HOME/.cache/plebench" \
+            "$HOME/.cache/huggingface"
+
+  score:
+    if: inputs.mode == 'score'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out PLE kit
+        uses: actions/checkout@v4
+        with:
+          repository: google-research/ple
+          ref: 8320f0402fdca9f42476607f72bcfd5271cd50c9
+          path: ple
+          persist-credentials: false
+
+      - name: Install uv and Harbor 0.20.0
+        run: |
+          set -euo pipefail
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/uv" tool install "harbor==0.20.0" --with websockets
+          probe=$(sed -n '1s/^#!//p' "$HOME/.local/bin/harbor")
+          version=$("$probe" -c "import importlib.metadata as m, websockets; print(m.version('harbor'))")
+          test "$version" = "0.20.0"
+          echo "harbor ${version}"
+
+      - name: Check CPU, RAM, disk, Docker, and dataset access
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        working-directory: ple
+        run: |
+          set -euo pipefail
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "GitHub secret HF_TOKEN is empty."
+            exit 1
+          fi
+          if find "$GITHUB_WORKSPACE/harness" \( -name '*.env' -o -name 'gcp-sa.json' \) | grep -q .; then
+            echo "The harness checkout contains an env or credential file. Remove it before this run."
+            exit 1
+          fi
+          docker info >/dev/null
+          uv sync --quiet
+          host_cpus=$(nproc)
+          host_mem=$(awk '/MemTotal:/ {print $2 * 1024}' /proc/meminfo)
+          docker_cpus=$(docker info --format '{{.NCPU}}')
+          docker_mem=$(docker info --format '{{.MemTotal}}')
+          disk=$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')
+          specs=$(uv run --quiet --no-sync python - <<'PY'
+          import os, sys, tomllib
+          from pathlib import Path
+          token = os.environ["HF_TOKEN"]
+          dest = Path(os.environ["RUNNER_TEMP"]) / "wind-task-toml"
+          dest.mkdir(parents=True, exist_ok=True)
+          try:
+              from huggingface_hub import hf_hub_download
+              path = hf_hub_download(
+                  repo_id="google/physical-engineerings-last-exam",
+                  repo_type="dataset",
+                  filename="tasks/wind-diaphragm-shear/task.toml",
+                  token=token,
+                  local_dir=str(dest),
+              )
+          except Exception as exc:
+              name = type(exc).__name__
+              if name == "GatedRepoError" or "403" in str(exc):
+                  print("Hugging Face returned 403. The HF_TOKEN account cannot download the gated dataset.", file=sys.stderr)
+                  sys.exit(2)
+              print(f"dataset download failed ({name})", file=sys.stderr)
+              sys.exit(1)
+          env = tomllib.loads(Path(path).read_text(encoding="utf-8")).get("environment") or {}
+          cpus = env.get("cpus")
+          mem = env.get("memory_mb")
+          if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
+              cpus = 2
+          if not isinstance(mem, int) or isinstance(mem, bool) or mem < 1:
+              mem = 4096
+          print(f"{cpus} {mem}")
+          PY
+          )
+          task_cpus=${specs%% *}
+          task_mib=${specs##* }
+          # Each container is limited on its own. The serve container asks for
+          # 2 CPUs; the egress proxy asks for none. Their sum is not a Docker limit.
+          serve_cpus=2
+          if [ "$task_cpus" -gt "$serve_cpus" ]; then
+            limit_cpus=$task_cpus
+          else
+            limit_cpus=$serve_cpus
+          fi
+          need_mem=$((task_mib * 1048576 + 4 * 1073741824 + 256 * 1048576))
+          need_disk=$((10 * 1073741824))
+          {
+            echo "### Capacity"
+            echo "- Task container: ${task_cpus} CPUs, ${task_mib} MiB"
+            echo "- Serve container: 2 CPUs, 4 GiB"
+            echo "- Egress proxy: 256 MiB"
+            echo "- Largest CPU limit: ${limit_cpus}. CPU limits are not added together."
+            echo "- Memory reserved together: $((need_mem / 1073741824)) GiB plus $(( (need_mem % 1073741824) / 1048576 )) MiB"
+            echo "- Host CPUs: ${host_cpus}. Docker CPUs: ${docker_cpus}."
+            echo "- Host RAM: $((host_mem / 1048576)) MiB. Docker RAM: $((docker_mem / 1048576)) MiB."
+            echo "- Free disk: $((disk / 1073741824)) GiB."
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$RUNNER_TEMP/wind-task-toml"
+          short=0
+          if [ "$host_cpus" -lt "$limit_cpus" ] || [ "$docker_cpus" -lt "$limit_cpus" ]; then
+            echo "Need a Docker daemon with at least ${limit_cpus} CPUs for the largest container. Host has ${host_cpus} and Docker has ${docker_cpus}."
+            short=1
+          fi
+          if [ "$host_mem" -lt "$need_mem" ] || [ "$docker_mem" -lt "$need_mem" ]; then
+            echo "Need ${need_mem} bytes of RAM. Host has ${host_mem} and Docker has ${docker_mem}."
+            short=1
+          fi
+          if [ "$disk" -lt "$need_disk" ]; then
+            echo "Need 10 GiB free disk. This filesystem has ${disk} bytes free."
+            short=1
+          fi
+          if [ "$short" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Capacity check passed."
+
+      - name: Run kit check and score wind-diaphragm-shear
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          VERTEXAI_PROJECT: ${{ secrets.VERTEXAI_PROJECT }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+        working-directory: ple
+        run: |
+          set -euo pipefail
+          if [ -z "${VERTEXAI_PROJECT:-}" ] || [ -z "${GCP_SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo "VERTEXAI_PROJECT and GCP_SERVICE_ACCOUNT_JSON must be set as GitHub secrets."
+            exit 1
+          fi
+          umask 077
+          cred="$RUNNER_TEMP/gcp-sa.json"
+          printf '%s' "$GCP_SERVICE_ACCOUNT_JSON" > "$cred"
+          python3 - "$cred" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          missing = [k for k in ("type", "project_id", "private_key", "client_email") if not data.get(k)]
+          if missing or data.get("type") != "service_account":
+              sys.exit("GCP_SERVICE_ACCOUNT_JSON is not a service-account key")
+          PY
+          export GOOGLE_APPLICATION_CREDENTIALS="$cred"
+          MODEL_PROXY_KEY=$(openssl rand -hex 24)
+          echo "::add-mask::${MODEL_PROXY_KEY}"
+          export MODEL_PROXY_KEY VERTEXAI_PROJECT
+          envfile="$RUNNER_TEMP/ple.env"
+          {
+            printf 'HF_TOKEN=%s\n' "$HF_TOKEN"
+            printf 'MODEL_PROXY_URL=%s\n' "http://127.0.0.1:4000"
+            printf 'MODEL_PROXY_KEY=%s\n' "$MODEL_PROXY_KEY"
+          } > "$envfile"
+          unset GCP_SERVICE_ACCOUNT_JSON
+          bash kit/model_proxy/start.sh > "$RUNNER_TEMP/model-proxy.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/model-proxy.pid"
+          ready=0
+          for _ in $(seq 1 300); do
+            if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:4000/health/liveliness"; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/model-proxy.pid")" 2>/dev/null; then
+              echo "The model proxy exited before it accepted connections."
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "The model proxy did not become ready."
+            exit 1
+          fi
+          uv run python -m kit check "$GITHUB_WORKSPACE/harness" --env-file "$envfile"
+          uv run python eval/run.py "$GITHUB_WORKSPACE/harness" \
+            --env-file "$envfile" \
+            --tasks wind-diaphragm-shear \
+            --trials 1 \
+            --no-export \
+            --out "$RUNNER_TEMP/ple-run"
+
+      - name: Report score, runtime, and token usage
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ["RUNNER_TEMP"]) / "ple-run" / "results.json"
+          lines = ["### Score", ""]
+          if not path.is_file():
+              lines.append("No results.json was written, so this job has no score, runtime, or token usage.")
+          else:
+              data = json.loads(path.read_text(encoding="utf-8"))
+              rows = data.get("tasks") or []
+              row = next((item for item in rows if item.get("id") == "wind-diaphragm-shear"), {})
+              tokens = row.get("tokens") or {}
+              seconds = row.get("seconds")
+              runtime = "not recorded" if not isinstance(seconds, (int, float)) else f"{seconds:.1f} seconds"
+              lines.extend([
+                  f"- Score: {row.get('score', data.get('score'))}",
+                  f"- Runtime: {runtime}",
+                  f"- Token usage: input {int(tokens.get('input') or 0)}, cache {int(tokens.get('cache') or 0)}, output {int(tokens.get('output') or 0)}",
+                  f"- Status: {row.get('status', 'unknown')}",
+                  f"- results.json: `{path}` (not uploaded; the run directory, transcripts, and this file are deleted before the job exits)",
+              ])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Remove credentials and the local transcript
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f "$RUNNER_TEMP/model-proxy.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/model-proxy.pid")" 2>/dev/null || true
+          fi
+          rm -rf \
+            "$RUNNER_TEMP/ple.env" \
+            "$RUNNER_TEMP/gcp-sa.json" \
+            "$RUNNER_TEMP/model-proxy.log" \
+            "$RUNNER_TEMP/model-proxy.pid" \
+            "$RUNNER_TEMP/ple-run" \
+            "$RUNNER_TEMP/wind-task-toml" \
+            "$HOME/.cache/plebench" \
+            "$HOME/.cache/huggingface"
