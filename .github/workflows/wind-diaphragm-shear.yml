@@ -3,7 +3,7 @@
 # Harbor pin required by that revision: 0.20.0 (with websockets).
 #
 # mode=smoke: kit check's synthetic hello.txt task. A temporary copy sets
-# model_api to gemini/gemini-3.8-flash. serve.py is not edited. No dataset.
+# model_api to gemini/gemini-3.5-flash-lite. serve.py is not edited. No dataset.
 # Secret: GEMINI_API_KEY.
 #
 # mode=score: wind-diaphragm-shear with the committed submission.yaml.
@@ -120,7 +120,7 @@ jobs:
           python3 - <<'PY'
           import json, os, time, urllib.error, urllib.request
           url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-          model = "gemini-3.8-flash"
+          model = "gemini-3.5-flash-lite"
           key = os.environ["GEMINI_API_KEY"]
           timeout = 45
           waits = (10, 20, 40)
@@ -202,7 +202,7 @@ jobs:
           path = pathlib.Path(sys.argv[1])
           text = path.read_text(encoding="utf-8")
           old = "model_api: google-cloud/claude-opus-5-5\n"
-          new = "model_api: gemini/gemini-3.8-flash\n"
+          new = "model_api: gemini/gemini-3.5-flash-lite\n"
           if old not in text:
               sys.exit("the baseline model_api line was not found")
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
@@ -235,7 +235,7 @@ jobs:
               lines.append("No check.json was written.")
           else:
               data = json.loads(path.read_text(encoding="utf-8"))
-              lines.append("- Model: gemini/gemini-3.8-flash through Google AI Studio")
+              lines.append("- Model: gemini/gemini-3.5-flash-lite through Google AI Studio")
               lines.append("- Task: kit check synthetic smoke (no PLE dataset)")
               for stage in data.get("stages") or []:
                   lines.append(f"- {stage.get('name')}: {stage.get('status')}")
