@@ -108,6 +108,76 @@ jobs:
           fi
           echo "Capacity check passed."
 
+      - name: Probe Gemini directly
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "GitHub secret GEMINI_API_KEY is empty."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, time, urllib.error, urllib.request
+          url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+          model = "gemini-3.8-flash"
+          key = os.environ["GEMINI_API_KEY"]
+          timeout = 45
+          waits = (10, 20, 40)
+          out = os.environ["RUNNER_TEMP"] + "/direct-probe.txt"
+
+          def once(limit_field):
+              started = time.monotonic()
+              payload = {
+                  "model": model,
+                  "messages": [{"role": "user", "content": "Reply with the word OK."}],
+                  limit_field: 32,
+              }
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + key,
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      response.read()
+                      return response.status, time.monotonic() - started, ""
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode(errors="replace")
+                  return exc.code, time.monotonic() - started, body
+              except TimeoutError:
+                  return "timeout", time.monotonic() - started, ""
+              except urllib.error.URLError as exc:
+                  reason = getattr(exc, "reason", exc)
+                  if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+                      return "timeout", time.monotonic() - started, ""
+                  return "error", time.monotonic() - started, ""
+
+          lines = []
+          try:
+              for attempt in range(1, 5):
+                  status, elapsed, body = once("max_completion_tokens")
+                  if status == 400 and "max_completion_tokens" in body:
+                      status, elapsed, body = once("max_tokens")
+                  line = f"direct status={status} elapsed={elapsed:.1f}"
+                  print(line, flush=True)
+                  lines.append(line)
+                  if status == 200 or status not in (503, "timeout") or attempt == 4:
+                      break
+                  time.sleep(waits[attempt - 1])
+          except Exception:
+              lines.append("direct status=error elapsed=0.0")
+              print(lines[-1], flush=True)
+          with open(out, "w", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("### Direct Gemini probe\n\n" + "\n".join(f"- {line}" for line in lines) + "\n")
+          PY
+          unset GEMINI_API_KEY
+
       - name: Run the synthetic Gemini smoke check
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -157,6 +227,10 @@ jobs:
           from pathlib import Path
           path = Path(os.environ["RUNNER_TEMP"]) / "smoke-work" / "check.json"
           lines = ["### Synthetic smoke", ""]
+          probe = Path(os.environ["RUNNER_TEMP"]) / "direct-probe.txt"
+          if probe.is_file():
+              lines.append("- Direct probe:")
+              lines.extend(f"  - {line}" for line in probe.read_text(encoding="utf-8").splitlines())
           if not path.is_file():
               lines.append("No check.json was written.")
           else:
@@ -176,6 +250,7 @@ jobs:
           rm -rf \
             "$RUNNER_TEMP/smoke-harness" \
             "$RUNNER_TEMP/gemini.env" \
+            "$RUNNER_TEMP/direct-probe.txt" \
             "$RUNNER_TEMP/smoke-work" \
             "$HOME/.cache/plebench" \
             "$HOME/.cache/huggingface"
