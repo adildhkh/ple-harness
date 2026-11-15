@@ -52,7 +52,25 @@ WRAP_UP = {
 }
 RESULT_CHARS = 20_000  # a longer tool result loses its middle
 # Seconds between retries once the SDK's own quick retries are exhausted.
-RETRY_WAITS = (5, 15, 30, 60, 120)
+RETRY_WAITS = (5, 15, 30, 60, 120, 120, 120, 120, 120, 120)
+# Optional pause between model calls, for a rate-limited key. 0 = off.
+MIN_CALL_GAP_SEC = float(os.environ.get("MIN_CALL_GAP_SEC", "0"))
+_last_call = 0.0
+_pace_lock = asyncio.Lock()
+
+
+async def pace():
+  """Waits so that model calls start at least MIN_CALL_GAP_SEC apart."""
+  global _last_call
+  if MIN_CALL_GAP_SEC <= 0:
+    return
+  async with _pace_lock:
+    loop = asyncio.get_running_loop()
+    gap = _last_call + MIN_CALL_GAP_SEC - loop.time()
+    if gap > 0:
+      await asyncio.sleep(gap)
+    _last_call = loop.time()
+
 # How endpoints word a 400 saying the conversation no longer fits the context
 # window: Claude, OpenAI and vLLM, Gemini, xAI.
 CONTEXT_FULL = re.compile(
@@ -269,11 +287,16 @@ async def recover(session, messages, exc, waits, until):
       status is None or status in (408, 409, 429) or status >= 500
   ):
     return False
+  try:
+    hint = float(exc.response.headers.get("retry-after", 0))
+  except (AttributeError, TypeError, ValueError):
+    hint = 0.0
+  wait = max(wait, min(hint, 300))
   left = session.time_left()
   if left is not None and left > until:
     wait = min(wait, left - until)
   await session.log(
-      f"model call failed ({str(exc)[:200]}); again in {wait:.0f} s"
+      f"model call failed (status {status}: {str(exc)[:1000]}); again in {wait:.0f} s"
   )
   await asyncio.sleep(wait)
   return True
@@ -361,6 +384,7 @@ async def agent(session, messages, tools, until, final=False):
       timeout = min(WRAP_UP_SEC, left)
     else:
       timeout = left - until
+    await pace()
     try:
       reply = await asyncio.wait_for(
           client.chat.completions.create(
