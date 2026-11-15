@@ -10,6 +10,8 @@
 # A temporary copy changes only model_api. The Pi agent and the dataset
 # verifier stay as published. Secrets: GEMINI_API_KEY and HF_TOKEN. Uses
 # --trials 1 and --no-export. Does not start unless send_gated_task is yes.
+# After scoring, a sanitized deliverable diagnostic is printed (no file
+# contents, no instruction text, no secrets).
 name: PLE Pi experiment
 
 "on":
@@ -471,6 +473,175 @@ jobs:
           print(summary, flush=True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
               fh.write(summary)
+          PY
+
+      - name: Sanitized deliverable diagnostic
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "ple-run"
+          expected_rel = (
+              "filesystem/final_batch4__structural_task5_wind_diaphragm_shear__blind"
+              "/output/submission.zip"
+          )
+          expected_name = "submission.zip"
+          write_tools = ("write", "edit", "bash")
+          write_attempted = "unknown"
+          write_result = "unknown"
+          expected_present = "unknown"
+          file_collected = "unknown"
+          exit_reason = "unknown"
+          provider_error = "no"
+          agent_status = "unknown"
+          tool_counts = {name: 0 for name in write_tools}
+          write_args_mention_zip = "no"
+          final_message_bytes = 0
+          changed_files = 0
+          collected_zip_bytes = None
+
+          def scrub(text: str) -> str:
+              text = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "[redacted]", text)
+              text = re.sub(r"hf_[A-Za-z0-9]{10,}", "[redacted]", text)
+              return text
+
+          def load_json(path: Path):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+              except Exception:
+                  return None
+
+          results = root / "results.json"
+          if results.is_file():
+              data = load_json(results) or {}
+              row = next(
+                  (
+                      item
+                      for item in (data.get("tasks") or [])
+                      if item.get("id") == "wind-diaphragm-shear"
+                  ),
+                  {},
+              )
+              agent_status = str(row.get("status") or "unknown")
+
+          trials = sorted(root.glob("attempt*/jobs/dev/wind-diaphragm-shear__*/"))
+          trial = trials[-1] if trials else None
+          if trial is None:
+              exit_reason = "no_trial_directory"
+          else:
+              result = load_json(trial / "result.json") or {}
+              agent = result.get("agent_result") or {}
+              verifier = result.get("verifier_result") or {}
+              exc = result.get("exception_info") or result.get("exception") or {}
+              if isinstance(exc, dict) and exc:
+                  exit_reason = scrub(str(exc.get("type") or exc.get("message") or "exception"))[:120]
+              elif agent.get("failure_reason") or agent.get("error_message"):
+                  exit_reason = scrub(
+                      str(agent.get("failure_reason") or agent.get("error_message"))
+                  )[:120]
+              else:
+                  reward = ((verifier.get("rewards") or {}).get("reward"))
+                  exit_reason = f"harbor_ok reward={reward}"
+
+              agent_dir = trial / "agent"
+              deliverables = agent_dir / "deliverables"
+              capture = load_json(deliverables / "capture.json") or {}
+              changed = capture.get("changed") or capture.get("files") or {}
+              if isinstance(changed, dict):
+                  changed_files = len(changed)
+              elif isinstance(changed, list):
+                  changed_files = len(changed)
+
+              fm = deliverables / "final_message.md"
+              if not fm.is_file():
+                  fm = deliverables / "final_message.txt"
+              if fm.is_file():
+                  final_message_bytes = fm.stat().st_size
+
+              zip_path = deliverables / "files" / expected_rel
+              if zip_path.is_file():
+                  expected_present = "yes"
+                  file_collected = "yes"
+                  collected_zip_bytes = zip_path.stat().st_size
+              else:
+                  expected_present = "no"
+                  any_zip = list((deliverables / "files").rglob(expected_name)) if (deliverables / "files").is_dir() else []
+                  file_collected = "yes_other_path" if any_zip else "no"
+                  if any_zip:
+                      collected_zip_bytes = any_zip[0].stat().st_size
+
+              # Scan agent logs for tool starts and provider errors. Never print bodies.
+              log_blobs = []
+              for path in agent_dir.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  if path.suffix.lower() not in {".log", ".txt", ".json", ".jsonl"} and path.name not in {
+                      "serve.log",
+                      "egress.log",
+                      "trajectory.json",
+                      "command-0",
+                  }:
+                      continue
+                  if path.stat().st_size > 8_000_000:
+                      continue
+                  try:
+                      log_blobs.append(path.read_text(encoding="utf-8", errors="replace"))
+                  except Exception:
+                      continue
+              blob = "\n".join(log_blobs)
+              if re.search(r"pi:\s*model error", blob, re.I) or re.search(
+                  r"stopReason\":\s*\"error\"", blob
+              ):
+                  provider_error = "yes"
+              # Pi harness logs: pi: write {...}
+              for tool in write_tools:
+                  tool_counts[tool] = len(
+                      re.findall(rf"pi:\s*{tool}\b", blob, flags=re.I)
+                  )
+              if any(tool_counts[t] for t in write_tools):
+                  write_attempted = "yes"
+              elif blob:
+                  write_attempted = "no"
+              if re.search(r"submission\.zip", blob, re.I):
+                  write_args_mention_zip = "yes"
+              # Heuristic write result from nearby error lines after a write tool.
+              if write_attempted == "yes":
+                  if re.search(
+                      r"pi:\s*(write|edit|bash).{0,200}(error|failed|EACCES|ENOENT|reject)",
+                      blob,
+                      re.I | re.S,
+                  ):
+                      write_result = "error_seen"
+                  elif expected_present == "yes":
+                      write_result = "success_inferred"
+                  else:
+                      write_result = "attempted_but_expected_missing"
+              elif write_attempted == "no":
+                  write_result = "no_write_tool_logged"
+
+          lines = [
+              "### Sanitized deliverable diagnostic",
+              "",
+              f"- write_attempted: {write_attempted}",
+              f"- write_tool_counts: write={tool_counts['write']} edit={tool_counts['edit']} bash={tool_counts['bash']}",
+              f"- write_args_mention_submission_zip: {write_args_mention_zip}",
+              f"- write_result: {write_result}",
+              f"- expected_output_present_before_done: {expected_present}",
+              f"- file_collected: {file_collected}",
+              f"- collected_zip_bytes: {collected_zip_bytes}",
+              f"- changed_deliverable_files: {changed_files}",
+              f"- final_message_bytes: {final_message_bytes}",
+              f"- provider_error: {provider_error}",
+              f"- agent_status: {agent_status}",
+              f"- exit_reason: {exit_reason}",
+          ]
+          text = "\n".join(lines) + "\n"
+          print(text, flush=True)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(text)
           PY
 
       - name: Remove credentials and the local transcript
