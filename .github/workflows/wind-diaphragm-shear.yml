@@ -399,6 +399,123 @@ jobs:
           fi
           echo "Capacity check passed."
 
+      - name: Probe Gemini thinking HIGH (Pi effective level)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "GitHub secret GEMINI_API_KEY is empty."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, re, time, urllib.error, urllib.request
+
+          # Pi 1.1.0 clamps harness THINKING=max to high for gemini-3.5-flash-lite
+          # because catalog thinkingLevelMap sets max:null and xhigh:null.
+          model = "gemini-3.5-flash-lite"
+          key = os.environ["GEMINI_API_KEY"]
+          url = (
+              "https://generativelanguage.googleapis.com/v1beta/models/"
+              f"{model}:generateContent"
+          )
+          timeout = 45
+          out = os.environ["RUNNER_TEMP"] + "/thinking-probe.txt"
+          codes = (
+              "INVALID_ARGUMENT",
+              "FAILED_PRECONDITION",
+              "RESOURCE_EXHAUSTED",
+              "UNAVAILABLE",
+              "PERMISSION_DENIED",
+              "NOT_FOUND",
+              "INTERNAL",
+          )
+
+          def classify(status, body):
+              provider = "none"
+              for code in codes:
+                  if code in body:
+                      provider = code
+                      break
+              err_class = "ok" if status == 200 else "http_error"
+              if status == "timeout":
+                  err_class = "timeout"
+              elif status == "error":
+                  err_class = "transport_error"
+              # Never log body text; only structured fields.
+              return err_class, provider
+
+          def once(thinking_level):
+              started = time.monotonic()
+              payload = {
+                  "contents": [{"role": "user", "parts": [{"text": "Reply with OK."}]}],
+                  "generationConfig": {
+                      "maxOutputTokens": 32,
+                      "thinkingConfig": {
+                          "includeThoughts": True,
+                          "thinkingLevel": thinking_level,
+                      },
+                  },
+              }
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Content-Type": "application/json",
+                      "x-goog-api-key": key,
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      response.read()
+                      return response.status, time.monotonic() - started, ""
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode(errors="replace")
+                  return exc.code, time.monotonic() - started, body
+              except TimeoutError:
+                  return "timeout", time.monotonic() - started, ""
+              except urllib.error.URLError as exc:
+                  reason = getattr(exc, "reason", exc)
+                  if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+                      return "timeout", time.monotonic() - started, ""
+                  return "error", time.monotonic() - started, ""
+
+          lines = [
+              "harness_thinking=max",
+              "pi_effective_thinking=high",
+              "probe_thinking_level=HIGH",
+          ]
+          # Probe the effective Pi mapping first, then an unsupported MAX once.
+          for level in ("HIGH", "MAX"):
+              status, elapsed, body = once(level)
+              err_class, provider = classify(status, body)
+              line = (
+                  f"thinking_probe level={level} status={status} "
+                  f"error_class={err_class} provider_code={provider} elapsed={elapsed:.1f}"
+              )
+              print(line, flush=True)
+              lines.append(line)
+              if level == "HIGH" and status in (503, "timeout"):
+                  time.sleep(10)
+                  status, elapsed, body = once(level)
+                  err_class, provider = classify(status, body)
+                  line = (
+                      f"thinking_probe level={level} retry status={status} "
+                      f"error_class={err_class} provider_code={provider} elapsed={elapsed:.1f}"
+                  )
+                  print(line, flush=True)
+                  lines.append(line)
+          with open(out, "w", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(
+                  "### Gemini thinking probe\n\n"
+                  + "\n".join(f"- {line}" for line in lines)
+                  + "\n"
+              )
+          PY
+          unset GEMINI_API_KEY
+
       - name: Score wind-diaphragm-shear
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -502,11 +619,54 @@ jobs:
           final_message_bytes = 0
           changed_files = 0
           collected_zip_bytes = None
+          http_status = "unknown"
+          provider_code = "unknown"
+          error_class = "unknown"
+          # Pi 1.1.0 clamps harness THINKING=max to high for this model.
+          thinking_effective = "high"
+          harness_thinking = "max"
 
           def scrub(text: str) -> str:
               text = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "[redacted]", text)
               text = re.sub(r"hf_[A-Za-z0-9]{10,}", "[redacted]", text)
               return text
+
+          def classify_provider(blob: str):
+              status = "unknown"
+              code = "none"
+              klass = "none"
+              statuses = re.findall(
+                  r"\b(?:HTTP\/?\s*)?(?:status[=: ]+)?(400|401|403|404|408|429|500|502|503|504)\b",
+                  blob,
+                  flags=re.I,
+              )
+              if statuses:
+                  status = statuses[-1]
+              for name in (
+                  "INVALID_ARGUMENT",
+                  "FAILED_PRECONDITION",
+                  "RESOURCE_EXHAUSTED",
+                  "UNAVAILABLE",
+                  "PERMISSION_DENIED",
+                  "NOT_FOUND",
+                  "INTERNAL",
+              ):
+                  if re.search(rf"\b{name}\b", blob):
+                      code = name
+                      break
+              if re.search(r"Unsupported Google thinking level", blob, re.I):
+                  klass = "unsupported_thinking_mapping"
+              elif re.search(r"timeout|timed out", blob, re.I):
+                  klass = "timeout"
+              elif status == "503" or code == "UNAVAILABLE":
+                  klass = "unavailable"
+              elif status == "429" or code == "RESOURCE_EXHAUSTED":
+                  klass = "rate_limited"
+              elif status == "400" or code == "INVALID_ARGUMENT":
+                  klass = "invalid_argument"
+              elif re.search(r"pi:\s*model error|stopReason\":\s*\"error\"", blob, re.I):
+                  klass = "model_error"
+              return status, code, klass
 
           def load_json(path: Path):
               try:
@@ -596,6 +756,14 @@ jobs:
                   r"stopReason\":\s*\"error\"", blob
               ):
                   provider_error = "yes"
+              http_status, provider_code, error_class = classify_provider(blob)
+              # Prefer explicit thinking mentions if present; otherwise keep clamp result.
+              if re.search(r"thinkingLevel[\"'=: ]+HIGH", blob, re.I) or re.search(
+                  r"\bthinking(?: level)?[=: ]+high\b", blob, re.I
+              ):
+                  thinking_effective = "high"
+              elif re.search(r"Unsupported Google thinking level.*\bmax\b", blob, re.I):
+                  thinking_effective = "max_unmapped"
               # Pi harness logs: pi: write {...}
               for tool in write_tools:
                   tool_counts[tool] = len(
@@ -622,9 +790,18 @@ jobs:
               elif write_attempted == "no":
                   write_result = "no_write_tool_logged"
 
+          probe = Path(os.environ["RUNNER_TEMP"]) / "thinking-probe.txt"
+          probe_lines = []
+          if probe.is_file():
+              probe_lines = [
+                  line for line in probe.read_text(encoding="utf-8").splitlines() if line.strip()
+              ]
+
           lines = [
               "### Sanitized deliverable diagnostic",
               "",
+              f"- harness_thinking: {harness_thinking}",
+              f"- thinking_effective: {thinking_effective}",
               f"- write_attempted: {write_attempted}",
               f"- write_tool_counts: write={tool_counts['write']} edit={tool_counts['edit']} bash={tool_counts['bash']}",
               f"- write_args_mention_submission_zip: {write_args_mention_zip}",
@@ -635,9 +812,15 @@ jobs:
               f"- changed_deliverable_files: {changed_files}",
               f"- final_message_bytes: {final_message_bytes}",
               f"- provider_error: {provider_error}",
+              f"- error_class: {error_class}",
+              f"- http_status: {http_status}",
+              f"- provider_code: {provider_code}",
               f"- agent_status: {agent_status}",
               f"- exit_reason: {exit_reason}",
           ]
+          if probe_lines:
+              lines.append("- thinking_probe:")
+              lines.extend(f"  - {line}" for line in probe_lines)
           text = "\n".join(lines) + "\n"
           print(text, flush=True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
@@ -652,6 +835,7 @@ jobs:
             "$RUNNER_TEMP/ple.env" \
             "$RUNNER_TEMP/score-harness" \
             "$RUNNER_TEMP/ple-run" \
+            "$RUNNER_TEMP/thinking-probe.txt" \
             "$RUNNER_TEMP/wind-task-toml" \
             "$HOME/.cache/plebench" \
             "$HOME/.cache/huggingface"
