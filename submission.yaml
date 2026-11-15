@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: plan-verify
+name: pi-opus
 model_api: google-cloud/claude-opus-5-5
 install: >-
-  uv venv --python 3.12 /opt/harness/venv
+  npm ci --prefix {src} --no-fund --no-audit
+  && uv venv --python 3.12 /opt/harness/venv
   && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt
 serve: /opt/harness/venv/bin/python {src}/serve.py

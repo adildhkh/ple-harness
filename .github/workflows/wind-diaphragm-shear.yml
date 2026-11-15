@@ -1,17 +1,16 @@
 # Manual runs on a standard 4-vCPU ubuntu-24.04 runner.
 # Kit pin: google-research/ple 8320f0402fdca9f42476607f72bcfd5271cd50c9
 # Harbor pin required by that revision: 0.20.0 (with websockets).
+# Entry: official pi-opus sample. Agent logic is unchanged.
 #
 # mode=smoke: kit check's synthetic hello.txt task. A temporary copy sets
-# model_api to gemini/gemini-3.5-flash-lite. serve.py is not edited. No dataset.
-# Secret: GEMINI_API_KEY.
+# model_api to gemini/gemini-3.5-flash-lite. No dataset. Secret: GEMINI_API_KEY.
 #
 # mode=score: wind-diaphragm-shear through gemini/gemini-3.5-flash-lite.
-# A temporary copy changes only model_api. serve.py and the dataset verifier
-# stay as published. Secrets: GEMINI_API_KEY and HF_TOKEN. The run uses
-# --trials 1 and --no-export. It does not start unless send_gated_task is yes,
-# because unpaid Gemini may use submitted content to improve Google products.
-name: PLE baseline
+# A temporary copy changes only model_api. The Pi agent and the dataset
+# verifier stay as published. Secrets: GEMINI_API_KEY and HF_TOKEN. Uses
+# --trials 1 and --no-export. Does not start unless send_gated_task is yes.
+name: PLE Pi experiment
 
 "on":
   workflow_dispatch:
@@ -37,7 +36,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ple-${{ inputs.mode }}-${{ github.ref }}
+  group: ple-pi-${{ inputs.mode }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -242,6 +241,7 @@ jobs:
               lines.append("No check.json was written.")
           else:
               data = json.loads(path.read_text(encoding="utf-8"))
+              lines.append("- Harness: pi-opus (official sample)")
               lines.append("- Model: gemini/gemini-3.5-flash-lite through Google AI Studio")
               lines.append("- Task: kit check synthetic smoke (no PLE dataset)")
               for stage in data.get("stages") or []:
@@ -467,8 +467,10 @@ jobs:
                   f"- Status: {row.get('status', 'unknown')}",
                   f"- results.json: `{path}` (not uploaded; the run directory, transcripts, and this file are deleted before the job exits)",
               ])
+          summary = "\n".join(lines) + "\n"
+          print(summary, flush=True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write("\n".join(lines) + "\n")
+              fh.write(summary)
           PY
 
       - name: Remove credentials and the local transcript
