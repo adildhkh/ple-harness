@@ -52,16 +52,18 @@ THINKING = "max"
 # arrives
 STOP_BEFORE_SEC = 90
 CATALOG_TIMEOUT_SEC = 30
-# Pi settings: retry failed requests up to 8 times with exponential backoff
-# from 2 s to 60 s (~4 minutes total, versus Pi's 14 s default), set a 1-hour
+# Pi settings: retry failed requests with exponential backoff, set a 1-hour
 # HTTP idle timeout so long max-effort thinking is not cut off at 5 minutes,
 # and keep `streaming` cache warming so Pi refreshes Claude's prompt cache
 # during long commands.
+# Free-tier Gemini scored runs on this branch returned RESOURCE_EXHAUSTED in
+# agent logs while THINKING=max already clamped to high, so retries are longer
+# than Pi's sample defaults (8 x 2 s..60 s) to ride out rate limits.
 SETTINGS = {
     "defaultProjectTrust": "never",
     "quietStartup": True,
     "cacheWarming": "streaming",
-    "retry": {"maxRetries": 8, "baseDelayMs": 2000, "maxAgentDelayMs": 60000},
+    "retry": {"maxRetries": 16, "baseDelayMs": 4000, "maxAgentDelayMs": 120000},
     "httpIdleTimeoutMs": 3_600_000,
 }
 # Request features the Google Cloud route for Claude refuses. pi leaves them

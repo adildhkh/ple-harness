@@ -656,14 +656,14 @@ jobs:
                       break
               if re.search(r"Unsupported Google thinking level", blob, re.I):
                   klass = "unsupported_thinking_mapping"
-              elif re.search(r"timeout|timed out", blob, re.I):
-                  klass = "timeout"
-              elif status == "503" or code == "UNAVAILABLE":
-                  klass = "unavailable"
               elif status == "429" or code == "RESOURCE_EXHAUSTED":
                   klass = "rate_limited"
+              elif status == "503" or code == "UNAVAILABLE":
+                  klass = "unavailable"
               elif status == "400" or code == "INVALID_ARGUMENT":
                   klass = "invalid_argument"
+              elif re.search(r"timeout|timed out", blob, re.I):
+                  klass = "timeout"
               elif re.search(r"pi:\s*model error|stopReason\":\s*\"error\"", blob, re.I):
                   klass = "model_error"
               return status, code, klass
